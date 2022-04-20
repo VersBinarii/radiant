@@ -1,9 +1,12 @@
-use core::ops::RemAssign;
-
-use embedded_graphics_core::geometry::Point;
+use core::{fmt::Debug, ops::RemAssign};
+use embedded_graphics::{
+    pixelcolor::Rgb565,
+    primitives::{Line, Primitive, PrimitiveStyle},
+    Drawable,
+};
+use embedded_graphics_core::{draw_target::DrawTarget, geometry::Point, pixelcolor::RgbColor};
 use embedded_hal::{
-    digital::blocking::{InputPin, OutputPin},
-    spi::blocking::Transfer,
+    delay::blocking::DelayUs, digital::blocking::OutputPin, spi::blocking::Transfer,
 };
 
 const CHANNEL_SETTING_X: u8 = 0b10010000;
@@ -32,14 +35,15 @@ impl<E> Format for Error<E> {
 const MAX_SAMPLES: usize = 32;
 const TX_BUFF_LEN: usize = 5;
 
+#[derive(Debug, Clone)]
 pub struct CalibrationPoint {
-    a: [i16; 2],
-    b: [i16; 2],
-    c: [i16; 2],
+    a: Point,
+    b: Point,
+    c: Point,
 }
 
 impl CalibrationPoint {
-    pub fn delta(&self) -> i16 {
+    pub fn delta(&self) -> i32 {
         (self.a[0] - self.c[0]) * (self.b[1] - self.c[1])
             - (self.b[0] - self.c[0]) * (self.a[1] - self.c[1])
     }
@@ -65,14 +69,14 @@ impl Orientation {
     pub fn calibration_point(&self) -> CalibrationPoint {
         match self {
             Orientation::Portrait | &Orientation::PortraitFlipped => CalibrationPoint {
-                a: [10, 10],
-                b: [80, 210],
-                c: [200, 170],
+                a: Point::new(10, 10),
+                b: Point::new(80, 210),
+                c: Point::new(200, 170),
             },
             Orientation::Landscape | Orientation::LandscapeFlipped => CalibrationPoint {
-                a: [20, 25],
-                b: [160, 220],
-                c: [300, 110],
+                a: Point::new(20, 25),
+                b: Point::new(160, 220),
+                c: Point::new(300, 110),
             },
         }
     }
@@ -115,7 +119,7 @@ impl Orientation {
     }
 }
 
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Debug, defmt::Format)]
 pub enum TouchScreenState {
     IDLE,
     PRESAMPLING,
@@ -131,7 +135,7 @@ pub enum TouchScreenOperationMode {
 pub struct TouchSamples {
     sample_timer: u32,
     samples: [Point; MAX_SAMPLES],
-    counter: u8,
+    counter: usize,
 }
 
 impl core::default::Default for TouchSamples {
@@ -177,17 +181,10 @@ where
     CS: OutputPin,
 {
     pub fn new(spi: SPI, cs: CS, orientation: Orientation) -> Self {
-        let tx_buff = [
-            CHANNEL_SETTING_X >> 3,
-            CHANNEL_SETTING_X << 5,
-            CHANNEL_SETTING_Y >> 3,
-            CHANNEL_SETTING_Y << 5,
-            0,
-        ];
         Self {
             spi,
             cs,
-            tx_buff,
+            tx_buff: [0; TX_BUFF_LEN],
             rx_buff: [0; TX_BUFF_LEN],
             screen_state: TouchScreenState::IDLE,
             ts: TouchSamples::default(),
@@ -266,7 +263,24 @@ where
         self.ts.average()
     }
 
-    pub fn run(&mut self, is_released: bool, mut f: impl FnMut()) {
+    pub fn init<D: DelayUs>(&mut self, delay: &mut D) {
+        self.tx_buff[0] = 0x80;
+        self.cs.set_high().unwrap();
+        self.spi_read().unwrap();
+        delay.delay_ms(1).unwrap();
+
+        // Load the tx_buffer with the channels config
+        // for all subsequent reads
+        self.tx_buff = [
+            CHANNEL_SETTING_X >> 3,
+            CHANNEL_SETTING_X << 5,
+            CHANNEL_SETTING_Y >> 3,
+            CHANNEL_SETTING_Y << 5,
+            0,
+        ];
+    }
+
+    pub fn run(&mut self, is_released: bool, f: &mut impl FnMut()) {
         match self.screen_state {
             TouchScreenState::IDLE => {}
             TouchScreenState::PRESAMPLING => {
@@ -274,18 +288,22 @@ where
                     self.screen_state = TouchScreenState::RELEASED
                 }
                 let point_sample = self.read_touch_point().unwrap();
-                self.ts.samples[self.ts.counter as usize] = point_sample;
+                self.ts.samples[self.ts.counter] = point_sample;
                 self.ts.counter += 1;
-                if self.ts.counter as usize == MAX_SAMPLES {
+                if self.ts.counter + 1 == MAX_SAMPLES {
                     self.ts.counter = 0;
                     self.screen_state = TouchScreenState::TOUCHED;
                 }
             }
             TouchScreenState::TOUCHED => {
                 let point_sample = self.read_touch_point().unwrap();
-                self.ts.samples[self.ts.counter as usize] = point_sample;
+                self.ts.samples[self.ts.counter] = point_sample;
                 self.ts.counter += 1;
-                (self.ts.counter as usize).rem_assign(MAX_SAMPLES);
+                /*
+                 * Wrap around the counter if the screen
+                 * is touched for longer time
+                 */
+                self.ts.counter.rem_assign(MAX_SAMPLES - 1);
                 if is_released {
                     self.screen_state = TouchScreenState::RELEASED
                 }
@@ -315,5 +333,120 @@ where
          */
         f();
         self.screen_state = TouchScreenState::PRESAMPLING;
+    }
+
+    pub fn calibrate<DT, DELAY>(&mut self, dt: &mut DT, delay: &mut DELAY, f: &mut impl FnMut())
+    where
+        DT: DrawTarget<Color = Rgb565>,
+        DELAY: DelayUs,
+    {
+        let mut calibration_count = 0;
+        let mut new_a = Point::zero();
+        let mut new_b = Point::zero();
+        let mut new_c = Point::zero();
+        let old_cp = self.calibration_point.clone();
+        // Prepare the screen for points
+        let _ = dt.clear(Rgb565::BLACK);
+
+        // Set correct state to fetch raw data from touch controller
+        self.operation_mode = TouchScreenOperationMode::CALIBRATION;
+        while calibration_count < 4 {
+            defmt::println!("Calibrating step: {}", calibration_count);
+            // We must run our state machine to capture user input
+            self.run(true, f);
+            match calibration_count {
+                0 => {
+                    calibration_draw_point(dt, old_cp.a);
+                    if self.screen_state == TouchScreenState::TOUCHED {
+                        new_a = self.get_touch_point();
+                        let _ = delay.delay_ms(200);
+                        calibration_count += 1;
+                    }
+                }
+
+                1 => {
+                    calibration_draw_point(dt, old_cp.b);
+                    if self.screen_state == TouchScreenState::TOUCHED {
+                        new_b = self.get_touch_point();
+                        let _ = delay.delay_ms(200);
+                        calibration_count += 1;
+                    }
+                }
+                2 => {
+                    calibration_draw_point(dt, old_cp.c);
+                    if self.screen_state == TouchScreenState::TOUCHED {
+                        new_c = self.get_touch_point();
+                        let _ = delay.delay_ms(200);
+                        calibration_count += 1;
+                    }
+                }
+
+                3 => {
+                    // Create new calibration point from the captured samples
+                    let new_calibration_point = CalibrationPoint {
+                        a: new_a,
+                        b: new_b,
+                        c: new_c,
+                    };
+                    self.calibration_point = new_calibration_point;
+                    // and then re-caculate calibration
+                    //calibration_calculate (*this);
+                    let new_calibration_data =
+                        calculate_calibration(&old_cp, &self.calibration_point);
+                    self.calibration_data = new_calibration_data;
+                    calibration_count += 1;
+                }
+                _ => {}
+            }
+        }
+        self.operation_mode = TouchScreenOperationMode::NORMAL;
+    }
+}
+
+fn calibration_draw_point<DT: DrawTarget<Color = Rgb565>>(dt: &mut DT, p: Point) {
+    let _ = Line::new(Point::new(p.x - 4, p.y), Point::new(p.x + 4, p.y))
+        .into_styled(PrimitiveStyle::with_stroke(Rgb565::WHITE, 1))
+        .draw(dt);
+    let _ = Line::new(Point::new(p.x, p.y - 4), Point::new(p.x, p.y + 4))
+        .into_styled(PrimitiveStyle::with_stroke(Rgb565::WHITE, 1))
+        .draw(dt);
+}
+
+fn calculate_calibration(old_cp: &CalibrationPoint, new_cp: &CalibrationPoint) -> CalibrationData {
+    let delta = new_cp.delta() as f32;
+    let alpha_x = ((old_cp.a[0] - old_cp.c[0]) * (new_cp.b[1] - new_cp.c[1])
+        - (old_cp.b[0] - old_cp.c[0]) * (new_cp.a[1] - new_cp.c[1])) as f32
+        / delta;
+
+    let beta_x = ((new_cp.a[0] - new_cp.c[0]) * (old_cp.b[0] - old_cp.c[0])
+        - (new_cp.b[0] - new_cp.c[0]) * (old_cp.a[0] - old_cp.c[0])) as f32
+        / delta;
+
+    let delta_x = ((old_cp.a[0]) * (new_cp.b[0] * new_cp.c[1] - new_cp.c[0] * new_cp.b[1])
+        - (old_cp.b[0]) * (new_cp.a[0] * new_cp.c[1] - new_cp.c[0] * new_cp.a[1])
+        + (old_cp.c[0]) * (new_cp.a[0] * new_cp.b[1] - new_cp.b[0] * new_cp.a[1]))
+        as f32
+        / delta;
+
+    let alpha_y = ((old_cp.a[1] - old_cp.c[1]) * (new_cp.b[1] - new_cp.c[1])
+        - (old_cp.b[1] - old_cp.c[1]) * (new_cp.a[1] - new_cp.c[1])) as f32
+        / delta;
+
+    let beta_y = ((new_cp.a[0] - new_cp.c[0]) * (old_cp.b[1] - old_cp.c[1])
+        - (new_cp.b[0] - new_cp.c[0]) * (old_cp.a[1] - old_cp.c[1])) as f32
+        / delta;
+
+    let delta_y = ((old_cp.a[1]) * (new_cp.b[0] * new_cp.c[1] - new_cp.c[0] * new_cp.b[1])
+        - (old_cp.b[1]) * (new_cp.a[0] * new_cp.c[1] - new_cp.c[0] * new_cp.a[1])
+        + (old_cp.c[1]) * (new_cp.a[0] * new_cp.b[1] - new_cp.b[0] * new_cp.a[1]))
+        as f32
+        / delta;
+    CalibrationData {
+        alpha_x,
+        beta_x,
+        delta_x,
+        alpha_y,
+        beta_y,
+        delta_y,
     }
 }
