@@ -3,17 +3,15 @@
 
 use radiant as _;
 
-#[rtic::app(device = stm32f4xx_hal::pac)]
+#[rtic::app(device = stm32f4xx_hal::pac, dispatchers=[OTG_FS_WKUP])]
 mod app {
     use display_interface_spi::SPIInterface;
-    use embedded_graphics::{
-        mono_font::{ascii::FONT_6X10, MonoTextStyle},
-        pixelcolor::{BinaryColor, Rgb565},
-        prelude::*,
-        text::{Alignment, Text},
+    use embedded_graphics::{pixelcolor::Rgb565, prelude::*};
+    use ili9341::{DisplaySize240x320, Ili9341, Orientation};
+    use radiant::{
+        dummy_pin::{DummyOutputPin, MyIrq},
+        gui::{Button, Gui, GuiElement},
     };
-    use ili9341::{DisplaySize240x320, Ili9341, ModeState, Orientation};
-    use radiant::dummy_pin::DummyOutputPin;
     use stm32f4xx_hal::{
         gpio::{Alternate, Edge, NoPin, Output, Pin, PushPull},
         pac::{EXTI, SPI1, SPI5, TIM1},
@@ -21,30 +19,8 @@ mod app {
         spi::{Mode, NoMiso, Phase, Polarity, Spi},
         timer::{Channel, Delay, SysEvent},
     };
-    use xpt2046::{self, Xpt2046, Xpt2046Exti};
-    pub struct MyIrq<const C: char, const N: u8>(Pin<C, N>);
-    impl Xpt2046Exti for MyIrq<'A', 2> {
-        type Exti = EXTI;
-        fn clear_interrupt(&mut self) {
-            self.0.clear_interrupt_pending_bit();
-        }
+    use xpt2046::{self, Xpt2046};
 
-        fn disable_interrupt(&mut self, exti: &mut Self::Exti) {
-            self.0.disable_interrupt(exti);
-        }
-
-        fn enable_interrupt(&mut self, exti: &mut Self::Exti) {
-            self.0.enable_interrupt(exti);
-        }
-
-        fn is_high(&self) -> bool {
-            self.0.is_high()
-        }
-
-        fn is_low(&self) -> bool {
-            self.0.is_low()
-        }
-    }
     type TouchSpi = Spi<
         SPI1,
         (
@@ -65,6 +41,7 @@ mod app {
     struct Shared {
         xpt_drv: Xpt2046<TouchSpi, Pin<'A', 4, Output<PushPull>>, MyIrq<'A', 2>>,
         exti: EXTI,
+        gui: Gui,
     }
 
     #[local]
@@ -131,18 +108,6 @@ mod app {
         .unwrap();
 
         let _ = lcd.clear(Rgb565::BLUE);
-        // Create a new character style
-        let style = MonoTextStyle::new(&FONT_6X10, Rgb565::WHITE);
-
-        // Create a text at position (20, 30) and draw it using the previously defined style
-        Text::with_alignment(
-            "First line\nSecond line",
-            Point::new(20, 30),
-            style,
-            Alignment::Center,
-        )
-        .draw(&mut lcd)
-        .unwrap();
 
         // Touch interface
         let mut touch_irq = gpioa.pa2.into_pull_up_input();
@@ -169,11 +134,17 @@ mod app {
             xpt2046::Orientation::PortraitFlipped,
         );
         xpt_drv.init(&mut delay);
+        let button_up = Button::new("+", Point::new(10, 10), Size::new(45, 45), Rgb565::MAGENTA);
+        let button_down = Button::new("-", Point::new(60, 10), Size::new(45, 45), Rgb565::MAGENTA);
 
         (
             Shared {
                 xpt_drv,
                 exti: dp.EXTI,
+                gui: Gui {
+                    button_up,
+                    button_down,
+                },
             },
             Local {
                 blue_led,
@@ -184,23 +155,40 @@ mod app {
         )
     }
 
-    #[idle(local = [delay, lcd], shared = [xpt_drv, exti])]
-    fn idle(ctx: idle::Context) -> ! {
+    #[idle(local = [delay], shared = [xpt_drv, exti,gui])]
+    fn maintask(ctx: maintask::Context) -> ! {
         let mut xpt_drv = ctx.shared.xpt_drv;
-        let mut exti = ctx.shared.exti;
-        let delay = ctx.local.delay;
-        let lcd = ctx.local.lcd;
-        xpt_drv.lock(|xpt| exti.lock(|e| xpt.calibrate(lcd, delay, e)));
+        let _exti = ctx.shared.exti;
+        let _delay = ctx.local.delay;
+        let mut gui = ctx.shared.gui;
+
+        render::spawn().ok();
         loop {
             xpt_drv.lock(|xpt| {
                 if xpt.is_touched() {
                     let p = xpt.get_touch_point();
-                    defmt::println!("x:{} y:{}", p.x, p.y);
-                    Pixel(p, Rgb565::RED).draw(lcd);
-                    //xpt.clear_touch();
+                    gui.lock(|g| {
+                        g.button_up.update(&p);
+                        g.button_down.update(&p);
+                        if g.button_up.is_pressed() {
+                            defmt::println!("up pressed");
+                        }
+                        if g.button_down.is_pressed() {
+                            defmt::println!("down pressed");
+                        }
+                    });
+                    render::spawn().ok();
                 }
             });
         }
+    }
+
+    #[task(priority=3, local = [lcd], shared = [gui])]
+    fn render(mut ctx: render::Context) {
+        let lcd = ctx.local.lcd;
+        ctx.shared.gui.lock(|g| {
+            g.draw(lcd).expect("Error while rendering Gui");
+        })
     }
 
     #[task(binds = EXTI2, local = [], shared = [xpt_drv, exti])]
