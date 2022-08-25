@@ -9,25 +9,25 @@ version = "0.1.0"
 harness = false
 
 [dependencies]
-cortex-m = "0.7.3"
-cortex-m-rt = "0.7.0"
+cortex-m = "0.7.6"
 defmt = "0.3.0"
 defmt-rtt = "0.3.0"
 panic-probe = { version = "0.3.0", features = ["print-defmt"] }
-cortex-m-rtic = "1.0.0"
+cortex-m-rtic = "1.1.3"
 embedded-hal = "=1.0.0-alpha.7"
-bme280 = "0.4.1"
+bme280 = "0.4.4"
 ili9341 = { path = "../ili9341-rs"}
 display-interface = "0.4.1"
 display-interface-spi = "0.4.1"
 embedded-graphics = "0.7.1"
 embedded-graphics-core = "0.3.3"
-xpt2046 = {path = "../xpt2046", features = ["with_defmt"]}
+xpt2046 = {version = "0.3", features = ["with_defmt"]}
+heapless = "0.7.16"
 
 # TODO(4) enter your HAL here
 # some-hal = "1.2.3"
 [dependencies.stm32f4xx-hal]
-version = "0.13.0"
+version = "0.13.2"
 features = ["rt","stm32f411"]
 
 [dev-dependencies]
