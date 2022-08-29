@@ -3,136 +3,52 @@
 
 use radiant as _;
 
-#[rtic::app(device = stm32f4xx_hal::pac, dispatchers=[OTG_FS_WKUP])]
+#[rtic::app(device = stm32f4xx_hal::pac, dispatchers=[OTG_FS_WKUP, SDIO])]
 mod app {
-    use display_interface_spi::SPIInterface;
     use embedded_graphics::{pixelcolor::Rgb565, prelude::*};
-    use ili9341::{DisplaySize240x320, Ili9341, Orientation};
     use radiant::{
-        dummy_pin::{DummyOutputPin, MyIrq},
         gui::{Button, Gui, GuiElement},
+        peripherals::{
+            init_preipherals, BlueLedPin, Lcd, TouchDriver, TriakControlPin, ZeroCrossDetectPin,
+        },
     };
     use stm32f4xx_hal::{
-        gpio::{Alternate, Edge, NoPin, Output, Pin, PushPull},
-        pac::{EXTI, SPI1, SPI5, TIM1},
+        pac::{EXTI, TIM1},
         prelude::*,
-        spi::{Mode, NoMiso, Phase, Polarity, Spi},
-        timer::{Channel, Delay, SysEvent},
+        timer::{Delay, SysEvent},
     };
-    use xpt2046::{self, Xpt2046};
 
-    type TouchSpi = Spi<
-        SPI1,
-        (
-            Pin<'A', 5, Alternate<5>>,
-            Pin<'A', 6, Alternate<5>>,
-            Pin<'A', 7, Alternate<5>>,
-        ),
-    >;
-    type Lcd = Ili9341<
-        SPIInterface<
-            Spi<SPI5, (Pin<'B', 0, Alternate<6>>, NoPin, Pin<'A', 10, Alternate<6>>)>,
-            Pin<'B', 1, Output>,
-            Pin<'B', 2, Output>,
-        >,
-        DummyOutputPin,
-    >;
     #[shared]
     struct Shared {
-        xpt_drv: Xpt2046<TouchSpi, Pin<'A', 4, Output<PushPull>>, MyIrq<'A', 2>>,
+        xpt_drv: TouchDriver,
         exti: EXTI,
         gui: Gui,
     }
 
     #[local]
     struct Local {
-        blue_led: Pin<'C', 13, Output<PushPull>>,
+        blue_led: BlueLedPin,
         delay: Delay<TIM1, 1000000>,
         lcd: Lcd,
+        zero_crossing: ZeroCrossDetectPin,
+        triak_ctrl: TriakControlPin,
     }
 
     #[init]
     fn init(ctx: init::Context) -> (Shared, Local, init::Monotonics) {
-        let mut dp = ctx.device;
         let cp = ctx.core;
 
-        let rcc = dp.RCC.constrain();
-        let clocks = rcc.cfgr.use_hse(25.MHz()).sysclk(100.MHz()).freeze();
-
-        let gpioa = dp.GPIOA.split();
-        let gpiob = dp.GPIOB.split();
-        let gpioc = dp.GPIOC.split();
-
-        /*
-         * We need a backlight constrol
-         * TODO: We will need to be able to change the brighntess later
-         */
-        let backlight_pins = gpioa.pa3.into_alternate();
-        let mut pwm = dp.TIM2.pwm_hz(backlight_pins, 10.kHz(), &clocks);
-        pwm.enable(Channel::C4);
-        pwm.set_duty(Channel::C4, pwm.get_max_duty() / 2);
-
+        let (clocks, blue_led, zero_crossing, triak_ctrl, mut lcd, mut xpt_drv, mut delay, exti) =
+            init_preipherals(ctx.device).unwrap();
         /*
          * Indicator that stuff is running
          */
-        let blue_led = gpioc.pc13.into_push_pull_output();
         let mut systic = cp.SYST.counter_hz(&clocks);
         systic.start(1.kHz()).unwrap();
         systic.listen(SysEvent::Update);
 
-        /*
-         *  The ILI9341 driver
-         */
-        let lcd_clk = gpiob.pb0.into_alternate();
-        let lcd_miso = NoMiso {};
-        let lcd_mosi = gpioa.pa10.into_alternate().internal_pull_up(true);
-        let lcd_dc = gpiob.pb1.into_push_pull_output();
-        let lcd_cs = gpiob.pb2.into_push_pull_output();
-        let mode = Mode {
-            polarity: Polarity::IdleLow,
-            phase: Phase::CaptureOnFirstTransition,
-        };
-        let lcd_spi = dp
-            .SPI5
-            .spi((lcd_clk, lcd_miso, lcd_mosi), mode, 8.MHz(), &clocks);
-        let spi_iface = SPIInterface::new(lcd_spi, lcd_dc, lcd_cs);
-        let dummy_reset = DummyOutputPin::default();
-        let mut delay = dp.TIM1.delay_us(&clocks);
-        let mut lcd = Ili9341::new(
-            spi_iface,
-            dummy_reset,
-            &mut delay,
-            Orientation::PortraitFlipped,
-            DisplaySize240x320,
-        )
-        .unwrap();
-
         let _ = lcd.clear(Rgb565::BLUE);
 
-        // Touch interface
-        let mut touch_irq = gpioa.pa2.into_pull_up_input();
-        let mut syscfg = dp.SYSCFG.constrain();
-        touch_irq.make_interrupt_source(&mut syscfg);
-        touch_irq.trigger_on_edge(&mut dp.EXTI, Edge::Falling);
-        touch_irq.enable_interrupt(&mut dp.EXTI);
-        let touch_cs = gpioa.pa4.into_push_pull_output();
-        let touch_clk = gpioa.pa5.into_alternate();
-        let touch_mosi = gpioa.pa7.into_alternate().internal_pull_up(true);
-        let touch_miso = gpioa.pa6.into_alternate();
-        let touch_spi = Spi::new(
-            dp.SPI1,
-            (touch_clk, touch_miso, touch_mosi),
-            mode,
-            4.MHz(),
-            &clocks,
-        );
-
-        let mut xpt_drv = Xpt2046::new(
-            touch_spi,
-            touch_cs,
-            MyIrq(touch_irq),
-            xpt2046::Orientation::PortraitFlipped,
-        );
         xpt_drv.init(&mut delay);
         let button_up = Button::new("+", Point::new(10, 10), Size::new(45, 45), Rgb565::MAGENTA);
         let button_down = Button::new("-", Point::new(60, 10), Size::new(45, 45), Rgb565::MAGENTA);
@@ -140,7 +56,7 @@ mod app {
         (
             Shared {
                 xpt_drv,
-                exti: dp.EXTI,
+                exti,
                 gui: Gui {
                     button_up,
                     button_down,
@@ -150,6 +66,8 @@ mod app {
                 blue_led,
                 delay,
                 lcd,
+                zero_crossing,
+                triak_ctrl,
             },
             init::Monotonics(),
         )
@@ -197,6 +115,12 @@ mod app {
         let exti = ctx.shared.exti;
         (xpt, exti).lock(|xpt, exti| xpt.exti_irq_handle(exti))
     }
+
+    #[task(binds = EXTI15_10, local = [zero_crossing, triak_ctrl], shared = [])]
+    fn zero_crossing(ctx: zero_crossing::Context) {}
+
+    #[task(local = [], shared = [])]
+    fn triak_control(ctx: triak_control::Context) {}
 
     #[task(binds = SysTick, local = [counter:u16 = 0, blue_led], shared = [xpt_drv, exti])]
     fn systick(ctx: systick::Context) {
